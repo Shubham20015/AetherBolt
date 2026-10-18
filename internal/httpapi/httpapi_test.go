@@ -42,7 +42,7 @@ func (s *testStore) Get(_ context.Context, name string) (function.Function, erro
 }
 
 func TestHTTPRegisterAndInvoke(t *testing.T) {
-	service := function.NewService(newTestStore(), runtime.NewBuiltinRegistry())
+	service := function.NewService(newTestStore(), runtime.NewRouter(runtime.NewDockerExecutor(runtime.NewOSCommandRunner())))
 	server := httptest.NewServer(NewHandler(service, slog.New(slog.NewTextHandler(testingWriter{t}, nil))))
 	defer server.Close()
 	register := request(t, http.MethodPost, server.URL+"/v1/functions", `{"name":"upper","handler":"uppercase","timeout_ms":1000}`)
@@ -70,7 +70,7 @@ func TestHTTPRegisterAndInvoke(t *testing.T) {
 }
 
 func TestHTTPReturnsStructuredNotFound(t *testing.T) {
-	service := function.NewService(newTestStore(), runtime.NewBuiltinRegistry())
+	service := function.NewService(newTestStore(), runtime.NewRouter(runtime.NewDockerExecutor(runtime.NewOSCommandRunner())))
 	server := httptest.NewServer(NewHandler(service, slog.New(slog.NewTextHandler(testingWriter{t}, nil))))
 	defer server.Close()
 	response := request(t, http.MethodGet, server.URL+"/v1/functions/missing", "")

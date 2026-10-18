@@ -12,7 +12,7 @@ PostgreSQL is the source of truth for metadata and durable invocation state. Kaf
 | `invocation_attempts` | `id`, `invocation_id`, attempt number, worker ID, outcome, timings | unique `(invocation_id, attempt_number)`; forensic history |
 | `audit_events` | actor, action, target, request ID, timestamp | security/audit investigations |
 
-Phase 1 creates only `functions` and its state index. Its `active_version` is fixed at `1` because Phase 1 has trusted built-in handlers rather than deployable artifacts. `function_versions`, invocation, and deployment structures arrive with their owning phase, keeping the schema and service behavior synchronized.
+Phase 1 creates only `functions` and its state index. Phase 2 adds `runtime`, local `image` reference, `memory_mb`, and `cpu_millis` to that table. Its `active_version` is fixed at `1` because Phase 2 uses pre-built local images rather than deployable artifacts. `function_versions`, invocation, and deployment structures arrive with their owning phase, keeping the schema and service behavior synchronized.
 
 Important constraints: names are normalized and unique; exactly one active version is enforced transactionally; version artifact references/checksums cannot change after activation; legal lifecycle transitions are checked by the service and guarded by conditional SQL updates. Store only bounded result/error metadata in the main row; logs and oversized payloads eventually use object storage or a separate retention strategy.
 

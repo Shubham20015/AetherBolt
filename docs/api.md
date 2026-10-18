@@ -31,7 +31,7 @@ Phase 1 implements only health, registration, lookup, and synchronous invocation
 `POST /v1/functions`
 
 ```json
-{"name":"echo","handler":"echo","description":"Returns its event","timeout_ms":3000}
+{"name":"echo","handler":"echo","runtime":"builtin","description":"Returns its event","timeout_ms":3000}
 ```
 
 `201 Created`
@@ -49,13 +49,15 @@ Phase 1 implements only health, registration, lookup, and synchronous invocation
 `200 OK`
 
 ```json
-{"invocation_id":"01J...","function":"echo","version":1,"result":{"message":"hello"},"duration_ms":1}
+{"invocation_id":"01J...","function":"echo","version":1,"result":{"message":"hello"},"init_duration_ms":0,"handler_duration_ms":1,"cold_start":false}
 ```
 
 `POST /v1/functions/echo:invoke-async` accepts `{"event": {...}, "idempotency_key":"optional-client-key"}` and returns `{"invocation_id":"01J...","status":"QUEUED"}`. Reusing the same key for the same function/version returns the original accepted invocation; using it with a different payload is `409 idempotency_conflict`.
 
 ## Status and error mapping
 
-`400` malformed JSON/validation, `401` unauthenticated, `403` unauthorized, `404` absent function/version/invocation, `409` name conflict, invalid state, or idempotency conflict, `413` oversized payload, `429` rate/capacity limit, `500` unexpected server failure, `502` runtime/broker dependency failure, `503` unavailable/draining, and `504` synchronous execution deadline exceeded. Function-code failures are a successful platform response with an invocation terminal state and a contractually defined response status (initially `200` with outcome; refine before public API stability).
+To register a pre-built local container, set `runtime` to `container`, provide an `image` such as `aetherbolt-function-echo:dev`, and optionally set `memory_mb` (64–1024) and `cpu_millis` (50–1000). The container must implement the [execution contract](execution.md).
+
+`400` malformed JSON/validation, `401` unauthenticated, `403` unauthorized, `404` absent function/version/invocation, `409` name conflict, invalid state, or idempotency conflict, `413` oversized payload, `422` function-code/contract failure, `429` capacity exhausted, `500` unexpected server failure, `502` runtime/broker dependency failure, `503` unavailable/draining, and `504` synchronous execution deadline exceeded.
 
 Mutation endpoints will require an `Idempotency-Key` header in the production-style phases. List endpoints introduced later will use opaque cursor pagination, never unbounded result sets.

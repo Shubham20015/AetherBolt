@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/shubhamjain/aetherbolt/internal/httpapi"
 	"github.com/shubhamjain/aetherbolt/internal/runtime"
 	"github.com/shubhamjain/aetherbolt/internal/store"
+	"github.com/shubhamjain/aetherbolt/internal/worker"
 )
 
 func main() {
@@ -47,8 +49,16 @@ func main() {
 	}
 
 	repo := store.NewPostgresFunctionStore(db)
-	runtimes := runtime.NewBuiltinRegistry()
-	service := function.NewService(repo, runtimes)
+	runtimes := runtime.NewRouter(runtime.NewDockerExecutor(runtime.NewOSCommandRunner()))
+	scheduler, err := worker.NewManager(runtimes, worker.Config{
+		MaxConcurrent: envIntOrDefault("AETHERBOLT_MAX_CONCURRENT", 4),
+		QueueCapacity: envIntOrDefault("AETHERBOLT_QUEUE_CAPACITY", 16),
+	})
+	if err != nil {
+		logger.Error("invalid scheduler configuration", "error", err)
+		os.Exit(1)
+	}
+	service := function.NewService(repo, scheduler)
 	server := &http.Server{
 		Addr:              envOrDefault("AETHERBOLT_ADDR", ":8080"),
 		Handler:           httpapi.NewHandler(service, logger),
@@ -69,11 +79,27 @@ func main() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	<-signals
+	scheduler.BeginDrain()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 	}
+	if err := scheduler.Wait(shutdownCtx); err != nil {
+		logger.Error("execution drain failed", "error", err)
+	}
+}
+
+func envIntOrDefault(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return -1
+	}
+	return parsed
 }
 
 func envOrDefault(key, fallback string) string {

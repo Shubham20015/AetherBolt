@@ -17,3 +17,5 @@
 ## Non-claims
 
 Containers are a defense layer, not a complete tenant-isolation guarantee. A hostile multi-tenant production design needs stronger sandboxing, kernel hardening, network policy, image provenance, monitoring, and independent security review. Docker daemon access is privileged; it must remain exclusively on trusted platform components.
+
+Phase 2–3's concrete control set and known limitations are documented in [execution.md](execution.md).

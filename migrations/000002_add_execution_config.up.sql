@@ -1,0 +1,5 @@
+ALTER TABLE functions
+    ADD COLUMN runtime TEXT NOT NULL DEFAULT 'builtin' CHECK (runtime IN ('builtin', 'container')),
+    ADD COLUMN image TEXT NOT NULL DEFAULT '',
+    ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 128 CHECK (memory_mb BETWEEN 64 AND 1024),
+    ADD COLUMN cpu_millis INTEGER NOT NULL DEFAULT 250 CHECK (cpu_millis BETWEEN 50 AND 1000);

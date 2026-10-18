@@ -72,12 +72,12 @@ func (h *Handler) invoke(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_request", "event is required")
 		return
 	}
-	result, fn, elapsed, err := h.functions.Invoke(r.Context(), functionName(r.URL.Path), input.Event)
+	execution, fn, err := h.functions.Invoke(r.Context(), functionName(r.URL.Path), input.Event)
 	if err != nil {
 		h.writeDomainError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"invocation_id": requestID(r), "function": fn.Name, "version": fn.Version, "result": result, "duration_ms": elapsed.Milliseconds()})
+	writeJSON(w, http.StatusOK, map[string]any{"invocation_id": requestID(r), "function": fn.Name, "version": fn.Version, "result": execution.Result, "init_duration_ms": execution.InitDuration.Milliseconds(), "handler_duration_ms": execution.HandlerDuration.Milliseconds(), "cold_start": execution.ColdStart})
 }
 func (h *Handler) writeDomainError(w http.ResponseWriter, r *http.Request, err error) {
 	h.logger.Warn("request failed", "request_id", requestID(r), "error", err)
@@ -88,8 +88,16 @@ func (h *Handler) writeDomainError(w http.ResponseWriter, r *http.Request, err e
 		writeError(w, r, http.StatusConflict, "function_already_exists", err.Error())
 	case errors.Is(err, function.ErrUnknownHandler), errors.Is(err, function.ErrInvalidInput):
 		writeError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
-	case errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, function.ErrCapacity):
+		writeError(w, r, http.StatusTooManyRequests, "capacity_exhausted", "execution capacity is currently exhausted")
+	case errors.Is(err, function.ErrDraining):
+		writeError(w, r, http.StatusServiceUnavailable, "service_draining", "service is shutting down")
+	case errors.Is(err, function.ErrTimedOut), errors.Is(err, context.DeadlineExceeded):
 		writeError(w, r, http.StatusGatewayTimeout, "invocation_timed_out", "function execution exceeded its deadline")
+	case errors.Is(err, function.ErrFunctionFailed):
+		writeError(w, r, http.StatusUnprocessableEntity, "function_error", "function execution failed")
+	case errors.Is(err, function.ErrRuntimeFailure):
+		writeError(w, r, http.StatusBadGateway, "runtime_unavailable", "execution runtime is unavailable")
 	default:
 		writeError(w, r, http.StatusInternalServerError, "internal_error", "unexpected server error")
 	}
@@ -115,7 +123,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 func responseFunction(fn function.Function) map[string]any {
-	return map[string]any{"name": fn.Name, "handler": fn.Handler, "description": fn.Description, "state": fn.State, "active_version": fn.Version, "timeout_ms": fn.Timeout.Milliseconds(), "created_at": fn.CreatedAt}
+	return map[string]any{"name": fn.Name, "handler": fn.Handler, "description": fn.Description, "state": fn.State, "active_version": fn.Version, "timeout_ms": fn.Timeout.Milliseconds(), "runtime": fn.Runtime, "image": fn.Image, "memory_mb": fn.MemoryMB, "cpu_millis": fn.CPUMillis, "created_at": fn.CreatedAt}
 }
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")

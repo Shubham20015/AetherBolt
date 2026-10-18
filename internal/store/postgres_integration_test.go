@@ -44,6 +44,7 @@ func TestPostgresFunctionStore(t *testing.T) {
 
 	created, err := store.Create(ctx, function.Function{
 		Name: name, Handler: "echo", State: function.StateActive, Version: 1, Timeout: time.Second,
+		Runtime: function.RuntimeBuiltin, MemoryMB: 128, CPUMillis: 250,
 	})
 	if err != nil {
 		t.Fatalf("create function: %v", err)

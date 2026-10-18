@@ -17,13 +17,13 @@ func NewPostgresFunctionStore(db *sql.DB) *PostgresFunctionStore {
 }
 
 func (s *PostgresFunctionStore) Create(ctx context.Context, input function.Function) (function.Function, error) {
-	const query = `INSERT INTO functions (name, handler, description, state, active_version, timeout_ms)
-	VALUES ($1, $2, $3, $4, $5, $6)
-	RETURNING name, handler, description, state, active_version, timeout_ms, created_at`
+	const query = `INSERT INTO functions (name, handler, description, state, active_version, timeout_ms, runtime, image, memory_mb, cpu_millis)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	RETURNING name, handler, description, state, active_version, timeout_ms, runtime, image, memory_mb, cpu_millis, created_at`
 	var out function.Function
 	var timeoutMS int
-	err := s.db.QueryRowContext(ctx, query, input.Name, input.Handler, input.Description, input.State, input.Version, input.Timeout.Milliseconds()).Scan(
-		&out.Name, &out.Handler, &out.Description, &out.State, &out.Version, &timeoutMS, &out.CreatedAt)
+	err := s.db.QueryRowContext(ctx, query, input.Name, input.Handler, input.Description, input.State, input.Version, input.Timeout.Milliseconds(), input.Runtime, input.Image, input.MemoryMB, input.CPUMillis).Scan(
+		&out.Name, &out.Handler, &out.Description, &out.State, &out.Version, &timeoutMS, &out.Runtime, &out.Image, &out.MemoryMB, &out.CPUMillis, &out.CreatedAt)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return function.Function{}, function.ErrAlreadyExists
@@ -35,10 +35,10 @@ func (s *PostgresFunctionStore) Create(ctx context.Context, input function.Funct
 }
 
 func (s *PostgresFunctionStore) Get(ctx context.Context, name string) (function.Function, error) {
-	const query = `SELECT name, handler, description, state, active_version, timeout_ms, created_at FROM functions WHERE name = $1`
+	const query = `SELECT name, handler, description, state, active_version, timeout_ms, runtime, image, memory_mb, cpu_millis, created_at FROM functions WHERE name = $1`
 	var out function.Function
 	var timeoutMS int
-	err := s.db.QueryRowContext(ctx, query, name).Scan(&out.Name, &out.Handler, &out.Description, &out.State, &out.Version, &timeoutMS, &out.CreatedAt)
+	err := s.db.QueryRowContext(ctx, query, name).Scan(&out.Name, &out.Handler, &out.Description, &out.State, &out.Version, &timeoutMS, &out.Runtime, &out.Image, &out.MemoryMB, &out.CPUMillis, &out.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return function.Function{}, function.ErrNotFound
 	}
