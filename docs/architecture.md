@@ -58,7 +58,7 @@ sequenceDiagram
   participant S as Scheduler
   participant X as Runtime
   participant D as Database
-  C->>A: POST /v1/functions/{name}:invoke (JSON)
+  C->>A: POST /v1/functions/invoke?name={name} (JSON)
   A->>A: limit body, validate, assign request ID
   A->>R: resolve ACTIVE function version
   R-->>A: immutable version configuration

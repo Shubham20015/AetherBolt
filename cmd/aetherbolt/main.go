@@ -53,18 +53,28 @@ func main() {
 
 	repo := store.NewPostgresFunctionStore(db)
 	runtimes := runtime.NewRouter(runtime.NewDockerExecutor(runtime.NewOSCommandRunner()))
-	scheduler, err := worker.NewManager(runtimes, worker.Config{
+	// Synchronous and asynchronous execution get independent admission budgets so
+	// neither plane can starve the other; both wrap the same stateless runtime.
+	syncScheduler, err := worker.NewManager(runtimes, worker.Config{
 		MaxConcurrent: envIntOrDefault("AETHERBOLT_MAX_CONCURRENT", 4),
 		QueueCapacity: envIntOrDefault("AETHERBOLT_QUEUE_CAPACITY", 16),
 	})
 	if err != nil {
-		logger.Error("invalid scheduler configuration", "error", err)
+		logger.Error("invalid synchronous scheduler configuration", "error", err)
 		os.Exit(1)
 	}
-	service := function.NewService(repo, scheduler)
+	asyncScheduler, err := worker.NewManager(runtimes, worker.Config{
+		MaxConcurrent: envIntOrDefault("AETHERBOLT_ASYNC_MAX_CONCURRENT", 4),
+		QueueCapacity: envIntOrDefault("AETHERBOLT_ASYNC_QUEUE_CAPACITY", 16),
+	})
+	if err != nil {
+		logger.Error("invalid asynchronous scheduler configuration", "error", err)
+		os.Exit(1)
+	}
+	service := function.NewService(repo, syncScheduler)
 	kafkaClient := queue.NewKafka([]string{envOrDefault("AETHERBOLT_KAFKA_BROKER", "localhost:9092")}, envOrDefault("AETHERBOLT_KAFKA_TOPIC", "aetherbolt.invocations"))
 	defer kafkaClient.Close()
-	asyncService := asyncsvc.New(asyncsvc.NewPostgresStore(db), kafkaClient, scheduler)
+	asyncService := asyncsvc.New(asyncsvc.NewPostgresStore(db), kafkaClient, asyncScheduler)
 	workerCtx, stopWorkers := context.WithCancel(context.Background())
 	var workers sync.WaitGroup
 	workers.Add(1)
@@ -73,6 +83,11 @@ func main() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for {
+			// Recover invocations stranded by a crashed worker, then publish any
+			// due work (including deferred retries and DLQ records).
+			if err := asyncService.Reconcile(workerCtx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("invocation reconcile failed", "error", err)
+			}
 			if err := asyncService.Republish(workerCtx); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Warn("outbox republish failed", "error", err)
 			}
@@ -83,13 +98,19 @@ func main() {
 			}
 		}
 	}()
-	workers.Add(1)
-	go func() {
-		defer workers.Done()
-		if err := kafkaClient.Consume(workerCtx, "aetherbolt-workers", asyncService.Process); err != nil && !errors.Is(err, context.Canceled) {
-			logger.Warn("kafka consumer stopped", "error", err)
-		}
-	}()
+	// Several consumers share one group so partitions are processed in parallel;
+	// each is supervised so a transient error cannot stop the data plane.
+	consumerCount := envIntOrDefault("AETHERBOLT_ASYNC_CONSUMERS", 4)
+	if consumerCount < 1 {
+		consumerCount = 1
+	}
+	for i := 0; i < consumerCount; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			superviseConsumer(workerCtx, logger, kafkaClient, "aetherbolt-workers", asyncService.Process)
+		}()
+	}
 	server := &http.Server{
 		Addr:              envOrDefault("AETHERBOLT_ADDR", ":8080"),
 		Handler:           httpapi.NewHandler(service, logger).WithAsync(asyncService),
@@ -110,17 +131,52 @@ func main() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	<-signals
-	scheduler.BeginDrain()
+	syncScheduler.BeginDrain()
+	asyncScheduler.BeginDrain()
 	stopWorkers()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 	}
-	if err := scheduler.Wait(shutdownCtx); err != nil {
-		logger.Error("execution drain failed", "error", err)
+	if err := syncScheduler.Wait(shutdownCtx); err != nil {
+		logger.Error("synchronous execution drain failed", "error", err)
+	}
+	if err := asyncScheduler.Wait(shutdownCtx); err != nil {
+		logger.Error("asynchronous execution drain failed", "error", err)
 	}
 	workers.Wait()
+}
+
+// superviseConsumer restarts a consumer with backoff so a transient broker or
+// database error cannot permanently stop asynchronous processing. A long
+// healthy run resets the backoff.
+func superviseConsumer(ctx context.Context, logger *slog.Logger, consumer *queue.Kafka, group string, handle func(context.Context, string) error) {
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		started := time.Now()
+		err := consumer.Consume(ctx, group, handle)
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Since(started) > time.Minute {
+			backoff = time.Second
+		}
+		logger.Warn("kafka consumer stopped; restarting", "error", err, "backoff", backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			if backoff *= 2; backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
 }
 
 func envIntOrDefault(key string, fallback int) int {

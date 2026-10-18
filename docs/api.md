@@ -17,12 +17,14 @@ All endpoints are versioned under `/v1`, use `application/json`, and return `X-R
 | `GET /healthz` | Process liveness | `200` |
 | `GET /readyz` | Dependency readiness (later) | `200` / `503` |
 | `POST /v1/functions` | Register function metadata | `201` |
-| `GET /v1/functions/{name}` | Read function and active version | `200` |
-| `POST /v1/functions/{name}:invoke` | Synchronous invocation | `200` |
-| `POST /v1/functions/{name}:invoke-async` | Queue invocation | `202` |
+| `GET /v1/functions?name={name}` | Read function and active version | `200` |
+| `POST /v1/functions/invoke?name={name}` | Synchronous invocation | `200` |
+| `POST /v1/functions/invoke-async?name={name}` | Queue invocation | `202` |
 | `GET /v1/invocations/{id}` | Read durable outcome | `200` |
-| `POST /v1/functions/{name}/versions` | Deploy immutable artifact version | `201` |
-| `POST /v1/functions/{name}/rollback` | Select retained version | `200` |
+| `POST /v1/functions/versions?name={name}` | Deploy immutable artifact version | `201` |
+| `POST /v1/functions/rollback?name={name}` | Select retained version | `200` |
+
+Every function-scoped route takes the function name as a required `name` query parameter; omitting it returns `400 invalid_request`. The function is identified by the query parameter, not by a path segment.
 
 ## Representative contracts
 
@@ -38,7 +40,7 @@ All endpoints are versioned under `/v1`, use `application/json`, and return `X-R
 {"name":"echo","handler":"echo","state":"ACTIVE","active_version":1,"timeout_ms":3000,"runtime":"builtin","image":"","memory_mb":128,"cpu_millis":250,"created_at":"2026-10-11T00:00:00Z"}
 ```
 
-`POST /v1/functions/echo:invoke`
+`POST /v1/functions/invoke?name=echo`
 
 ```json
 {"event":{"message":"hello"}}
@@ -50,7 +52,7 @@ All endpoints are versioned under `/v1`, use `application/json`, and return `X-R
 {"invocation_id":"01J...","function":"echo","version":1,"result":{"message":"hello"},"init_duration_ms":0,"handler_duration_ms":1,"cold_start":false}
 ```
 
-`POST /v1/functions/echo:invoke-async`
+`POST /v1/functions/invoke-async?name=echo`
 
 ```json
 {"event":{"message":"hello"},"idempotency_key":"optional-client-key"}
@@ -86,7 +88,7 @@ Reusing the same key for the same function version with an identical payload ret
 
 Status values are `QUEUED`, `RUNNING`, `SUCCEEDED`, `FUNCTION_ERROR`, `TIMED_OUT`, `INFRASTRUCTURE_ERROR`, `RETRY_SCHEDULED`, and `DEAD_LETTERED`. `error_code` is empty on success and otherwise one of `FUNCTION_ERROR`, `TIMED_OUT`, or `INFRASTRUCTURE_ERROR`.
 
-`POST /v1/functions/echo/versions`
+`POST /v1/functions/versions?name=echo`
 
 ```json
 {"handler":"echo","runtime":"builtin","description":"Returns its event","timeout_ms":3000}
@@ -98,7 +100,7 @@ Status values are `QUEUED`, `RUNNING`, `SUCCEEDED`, `FUNCTION_ERROR`, `TIMED_OUT
 {"name":"echo","handler":"echo","state":"ACTIVE","active_version":2,"timeout_ms":3000,"runtime":"builtin","image":"","memory_mb":128,"cpu_millis":250,"created_at":"2026-10-11T00:00:00Z"}
 ```
 
-`POST /v1/functions/echo/rollback`
+`POST /v1/functions/rollback?name=echo`
 
 ```json
 {"version":1}

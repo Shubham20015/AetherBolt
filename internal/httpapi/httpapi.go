@@ -40,15 +40,15 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/functions":
 		h.register(w, r)
-	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/functions/") && strings.HasSuffix(r.URL.Path, "/versions"):
-		h.deploy(w, r)
-	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/functions/") && strings.HasSuffix(r.URL.Path, "/rollback"):
-		h.rollback(w, r)
-	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/functions/") && !strings.Contains(r.URL.Path, ":"):
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/functions":
 		h.get(w, r)
-	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/functions/") && strings.HasSuffix(r.URL.Path, ":invoke"):
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/functions/versions":
+		h.deploy(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/functions/rollback":
+		h.rollback(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/functions/invoke":
 		h.invoke(w, r)
-	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/functions/") && strings.HasSuffix(r.URL.Path, ":invoke-async"):
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/functions/invoke-async":
 		h.invokeAsync(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/invocations/"):
 		h.getInvocation(w, r)
@@ -78,6 +78,10 @@ func (h *Handler) invokeAsync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusServiceUnavailable, "async_unavailable", "async invocation is not configured")
 		return
 	}
+	name, ok := queryName(w, r)
+	if !ok {
+		return
+	}
 	var in struct {
 		Event          json.RawMessage `json:"event"`
 		IdempotencyKey string          `json:"idempotency_key"`
@@ -85,7 +89,7 @@ func (h *Handler) invokeAsync(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in) {
 		return
 	}
-	fn, err := h.functions.Get(r.Context(), strings.TrimSuffix(functionName(r.URL.Path), ":invoke-async"))
+	fn, err := h.functions.Get(r.Context(), name)
 	if err != nil {
 		h.writeDomainError(w, r, err)
 		return
@@ -98,11 +102,14 @@ func (h *Handler) invokeAsync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"invocation_id": inv.ID, "status": inv.Status, "duplicate": duplicate})
 }
 func (h *Handler) deploy(w http.ResponseWriter, r *http.Request) {
+	name, ok := queryName(w, r)
+	if !ok {
+		return
+	}
 	var input function.RegisterInput
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/functions/"), "/versions")
 	fn, err := h.functions.Deploy(r.Context(), name, input)
 	if err != nil {
 		h.writeDomainError(w, r, err)
@@ -111,6 +118,10 @@ func (h *Handler) deploy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, responseFunction(fn))
 }
 func (h *Handler) rollback(w http.ResponseWriter, r *http.Request) {
+	name, ok := queryName(w, r)
+	if !ok {
+		return
+	}
 	var input struct {
 		Version int `json:"version"`
 	}
@@ -121,7 +132,6 @@ func (h *Handler) rollback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_request", "version must be positive")
 		return
 	}
-	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/functions/"), "/rollback")
 	fn, err := h.functions.Rollback(r.Context(), name, input.Version)
 	if err != nil {
 		h.writeDomainError(w, r, err)
@@ -143,7 +153,11 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, responseFunction(fn))
 }
 func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
-	fn, err := h.functions.Get(r.Context(), functionName(r.URL.Path))
+	name, ok := queryName(w, r)
+	if !ok {
+		return
+	}
+	fn, err := h.functions.Get(r.Context(), name)
 	if err != nil {
 		h.writeDomainError(w, r, err)
 		return
@@ -151,6 +165,10 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, responseFunction(fn))
 }
 func (h *Handler) invoke(w http.ResponseWriter, r *http.Request) {
+	name, ok := queryName(w, r)
+	if !ok {
+		return
+	}
 	var input struct {
 		Event json.RawMessage `json:"event"`
 	}
@@ -161,7 +179,7 @@ func (h *Handler) invoke(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_request", "event is required")
 		return
 	}
-	execution, fn, err := h.functions.Invoke(r.Context(), functionName(r.URL.Path), input.Event)
+	execution, fn, err := h.functions.Invoke(r.Context(), name, input.Event)
 	if err != nil {
 		h.writeDomainError(w, r, err)
 		return
@@ -193,9 +211,15 @@ func (h *Handler) writeDomainError(w http.ResponseWriter, r *http.Request, err e
 		writeError(w, r, http.StatusInternalServerError, "internal_error", "unexpected server error")
 	}
 }
-func functionName(path string) string {
-	name := strings.TrimPrefix(path, "/v1/functions/")
-	return strings.TrimSuffix(name, ":invoke")
+
+// queryName reads the required function name from the ?name= query parameter.
+func queryName(w http.ResponseWriter, r *http.Request) (string, bool) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		writeError(w, r, http.StatusBadRequest, "invalid_request", "name query parameter is required")
+		return "", false
+	}
+	return name, true
 }
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)

@@ -19,6 +19,7 @@ type fakeStore struct {
 	getFn      func(context.Context, string) (Invocation, error)
 	pendingFn  func(context.Context, int) ([]OutboxMessage, error)
 	markFn     func(context.Context, OutboxMessage) error
+	reclaimFn  func(context.Context) (int, error)
 }
 
 func (s *fakeStore) Enqueue(ctx context.Context, fn function.Function, event json.RawMessage, key string) (Invocation, bool, error) {
@@ -38,6 +39,12 @@ func (s *fakeStore) PendingOutbox(ctx context.Context, n int) ([]OutboxMessage, 
 }
 func (s *fakeStore) MarkPublished(ctx context.Context, message OutboxMessage) error {
 	return s.markFn(ctx, message)
+}
+func (s *fakeStore) ReclaimExpired(ctx context.Context) (int, error) {
+	if s.reclaimFn == nil {
+		return 0, nil
+	}
+	return s.reclaimFn(ctx)
 }
 
 type fakeExecutor struct {
@@ -99,7 +106,7 @@ func TestEnqueueDelegatesAndReportsDuplicate(t *testing.T) {
 		return Invocation{ID: "inv-1", FunctionName: fn.Name, Status: "QUEUED"}, true, nil
 	}}
 	service := New(store, &fakePublisher{}, &fakeExecutor{})
-	inv, duplicate, err := service.Enqueue(context.Background(), function.Function{Name: "echo"}, json.RawMessage(`{}`), "client-key")
+	inv, duplicate, err := service.Enqueue(context.Background(), function.Function{Name: "echo", State: function.StateActive}, json.RawMessage(`{}`), "client-key")
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -304,5 +311,90 @@ func TestRetryDelayIsBoundedAndJittered(t *testing.T) {
 	}
 	if len(seen) < 2 {
 		t.Fatalf("expected jitter to produce varied delays, got %d distinct value(s)", len(seen))
+	}
+}
+
+func TestEnqueueRejectsInactiveFunction(t *testing.T) {
+	called := false
+	store := &fakeStore{enqueueFn: func(context.Context, function.Function, json.RawMessage, string) (Invocation, bool, error) {
+		called = true
+		return Invocation{}, false, nil
+	}}
+	service := New(store, &fakePublisher{}, &fakeExecutor{})
+	for _, state := range []string{"DISABLED", "FAILED", ""} {
+		if _, _, err := service.Enqueue(context.Background(), function.Function{Name: "upper", State: state}, json.RawMessage(`{}`), ""); !errors.Is(err, function.ErrInvalidInput) {
+			t.Fatalf("state %q: expected invalid input, got %v", state, err)
+		}
+	}
+	if called {
+		t.Fatal("store must not be called for a non-active function")
+	}
+}
+
+func TestReconcileDelegatesToReclaim(t *testing.T) {
+	called := false
+	store := &fakeStore{reclaimFn: func(context.Context) (int, error) {
+		called = true
+		return 2, nil
+	}}
+	service := New(store, &fakePublisher{}, &fakeExecutor{})
+	if err := service.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !called {
+		t.Fatal("reconcile must reclaim expired invocations")
+	}
+}
+
+func TestProcessPersistsOutcomeAfterCancellation(t *testing.T) {
+	// Simulate shutdown: the consumer context is already cancelled when the
+	// terminal write happens. The write must still use a live context.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	writeErr := errors.New("terminal write was never called")
+	store := &fakeStore{
+		claimFn: func(context.Context, string) (Invocation, error) {
+			return Invocation{ID: "inv-1", Attempt: 1, MaxAttempts: 3, Function: function.Function{Timeout: time.Second}}, nil
+		},
+		completeFn: func(cctx context.Context, _ Invocation, _ function.ExecutionResult, runErr error, _ time.Duration) error {
+			writeErr = cctx.Err()
+			if !unscoredFailure(runErr) {
+				t.Errorf("cancelled execution must be an unscored infrastructure failure, got %v", runErr)
+			}
+			return nil
+		},
+	}
+	executor := &fakeExecutor{invokeFn: func(ctx context.Context, _ function.Function, _ json.RawMessage) (function.ExecutionResult, error) {
+		<-ctx.Done()
+		return function.ExecutionResult{}, ctx.Err()
+	}}
+	service := New(store, &fakePublisher{}, executor)
+	if err := service.Process(cancelled, "inv-1"); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if writeErr != nil {
+		t.Fatalf("terminal write used a cancelled context: %v", writeErr)
+	}
+}
+
+func TestFailureClassification(t *testing.T) {
+	cases := []struct {
+		err  error
+		code string
+	}{
+		{function.ErrTimedOut, "TIMED_OUT"},
+		{function.ErrRuntimeFailure, "INFRASTRUCTURE_ERROR"},
+		{function.ErrCapacity, "INFRASTRUCTURE_ERROR"},
+		{function.ErrDraining, "INFRASTRUCTURE_ERROR"},
+		{context.Canceled, "INFRASTRUCTURE_ERROR"},
+		{function.ErrFunctionFailed, "FUNCTION_ERROR"},
+	}
+	for _, tc := range cases {
+		if got := failureCode(tc.err); got != tc.code {
+			t.Errorf("failureCode(%v) = %s, want %s", tc.err, got, tc.code)
+		}
+	}
+	if !unscoredFailure(function.ErrCapacity) || !unscoredFailure(context.Canceled) || unscoredFailure(function.ErrFunctionFailed) {
+		t.Fatal("unscoredFailure must exempt only scheduler/cancellation failures")
 	}
 }

@@ -41,6 +41,7 @@ docker compose up -d postgres kafka kafka-init
 psql "postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable" -f migrations/000001_create_functions.up.sql
 psql "postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable" -f migrations/000002_add_execution_config.up.sql
 psql "postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable" -f migrations/000003_versions_and_async.up.sql
+psql "postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable" -f migrations/000004_invocation_lease.up.sql
 go mod tidy
 AETHERBOLT_DATABASE_URL='postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable' go run ./cmd/aetherbolt
 ```
@@ -50,15 +51,15 @@ In another terminal:
 ```sh
 # synchronous
 curl -sS -X POST http://localhost:8080/v1/functions -H 'Content-Type: application/json' -d '{"name":"upper","handler":"uppercase"}'
-curl -sS -X POST http://localhost:8080/v1/functions/upper:invoke -H 'Content-Type: application/json' -d '{"event":{"text":"hello"}}'
+curl -sS -X POST http://localhost:8080/v1/functions/invoke?name=upper -H 'Content-Type: application/json' -d '{"event":{"text":"hello"}}'
 
 # asynchronous (durable accept, then poll)
-curl -sS -X POST http://localhost:8080/v1/functions/upper:invoke-async -H 'Content-Type: application/json' -d '{"event":{"text":"hello"},"idempotency_key":"demo-1"}'
+curl -sS -X POST 'http://localhost:8080/v1/functions/invoke-async?name=upper' -H 'Content-Type: application/json' -d '{"event":{"text":"hello"},"idempotency_key":"demo-1"}'
 curl -sS http://localhost:8080/v1/invocations/<invocation_id>
 
 # deploy an immutable version, then roll back
-curl -sS -X POST http://localhost:8080/v1/functions/upper/versions -H 'Content-Type: application/json' -d '{"handler":"uppercase"}'
-curl -sS -X POST http://localhost:8080/v1/functions/upper/rollback -H 'Content-Type: application/json' -d '{"version":1}'
+curl -sS -X POST 'http://localhost:8080/v1/functions/versions?name=upper' -H 'Content-Type: application/json' -d '{"handler":"uppercase"}'
+curl -sS -X POST 'http://localhost:8080/v1/functions/rollback?name=upper' -H 'Content-Type: application/json' -d '{"version":1}'
 ```
 
 ## Tests
@@ -86,16 +87,16 @@ docker build -t aetherbolt-function-echo:dev examples/functions/echo
 curl -sS -X POST http://localhost:8080/v1/functions \
   -H 'Content-Type: application/json' \
   -d '{"name":"container-echo","handler":"stdin-json","runtime":"container","image":"aetherbolt-function-echo:dev","timeout_ms":3000,"memory_mb":128,"cpu_millis":250}'
-curl -sS -X POST http://localhost:8080/v1/functions/container-echo:invoke \
+curl -sS -X POST 'http://localhost:8080/v1/functions/invoke?name=container-echo' \
   -H 'Content-Type: application/json' \
   -d '{"event":{"message":"hello from a container"}}'
 ```
 
 The platform only accepts locally built `aetherbolt-function-*` image references and uses `docker run --pull never`. Registering or deploying a container function resolves the image to its `sha256:` content ID (`docker image inspect`) and stores that digest as the immutable artifact reference, so a later re-tag or rebuild cannot silently change what a deployed version runs. Remote registries, signatures, and image upload remain future work. See [the execution contract and limits](docs/execution.md).
 
-The scheduler is configured by `AETHERBOLT_MAX_CONCURRENT` (default `4`) and `AETHERBOLT_QUEUE_CAPACITY` (default `16`). Once `active + waiting` reaches their sum, synchronous invocation returns `429`; during graceful shutdown, new work returns `503` while admitted work drains.
+The synchronous scheduler is configured by `AETHERBOLT_MAX_CONCURRENT` (default `4`) and `AETHERBOLT_QUEUE_CAPACITY` (default `16`). Once `active + waiting` reaches their sum, synchronous invocation returns `429`; during graceful shutdown, new work returns `503` while admitted work drains. The asynchronous plane has its own independent budget (`AETHERBOLT_ASYNC_MAX_CONCURRENT`, `AETHERBOLT_ASYNC_QUEUE_CAPACITY`), so neither plane can starve the other.
 
-The async data plane is configured by `AETHERBOLT_KAFKA_BROKER` (default `localhost:9092`) and `AETHERBOLT_KAFKA_TOPIC` (default `aetherbolt.invocations`); the dead-letter topic is derived as `<topic>.dlq`. An accepted async invocation is written to an outbox in the same transaction as its row, so acceptance succeeds even while the broker is down; a republisher reconciles unpublished records (including DLQ records) after the broker returns.
+The async data plane is configured by `AETHERBOLT_KAFKA_BROKER` (default `localhost:9092`) and `AETHERBOLT_KAFKA_TOPIC` (default `aetherbolt.invocations`); the dead-letter topic is derived as `<topic>.dlq`. An accepted async invocation is written to an outbox in the same transaction as its row, so acceptance succeeds even while the broker is down; a republisher reconciles unpublished records (including DLQ records) after the broker returns, and also reclaims invocations stranded `RUNNING` by a crashed worker. `AETHERBOLT_ASYNC_CONSUMERS` (default `4`) sets how many supervised consumers join the group; effective parallelism is `min(consumers, topic partitions)`.
 
 ### Test intent
 

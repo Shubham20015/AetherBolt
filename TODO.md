@@ -29,8 +29,10 @@
 - [x] Bounded retries with exponential backoff and full jitter; a durable DLQ outbox row on exhaustion.
 - [x] Duplicate deliveries acknowledged without re-running (conditional claim transition).
 - [x] Consumer and republisher cancellation during shutdown.
+- [x] Per-invocation execution lease and reclaim of stale `RUNNING` rows (reconciler alongside the republisher).
+- [x] In-place consumer retries with capped backoff plus supervised reader restart; offsets never commit past a failed record.
+- [x] Independent synchronous/asynchronous admission budgets and a bounded, partitioned consumer pool.
 - [x] Focused async unit tests and opt-in PostgreSQL/Kafka integration tests.
-- [ ] Per-invocation execution lease and reclaim of stale `RUNNING` rows.
 - [ ] Outbox compaction / retention for historical retry rows.
 
 ## Phase 5 — immutable versions and deployment

@@ -370,3 +370,128 @@ func TestAsyncInvocationPinnedToAcceptedVersion(t *testing.T) {
 		t.Fatalf("accepted invocation must stay pinned to version 1, got %#v", claimed)
 	}
 }
+
+func countOutboxTopic(t *testing.T, db *sql.DB, invocationID, topic string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM invocation_outbox WHERE invocation_id=$1 AND topic=$2`, invocationID, topic).Scan(&n); err != nil {
+		t.Fatalf("count outbox topic: %v", err)
+	}
+	return n
+}
+
+func TestAsyncReclaimRecoversStuckInvocation(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	repo := NewPostgresStore(db)
+	repo.lease = 40 * time.Millisecond
+	fn := seedFunction(t, db, newFunctionName())
+
+	inv, _, err := repo.Enqueue(ctx, fn, json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, err := repo.Claim(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed.Attempt != 1 {
+		t.Fatalf("attempt = %d, want 1", claimed.Attempt)
+	}
+
+	// Simulate a worker that died after claiming: leave the row RUNNING and let
+	// the lease elapse.
+	time.Sleep(200 * time.Millisecond)
+	reclaimed, err := repo.ReclaimExpired(ctx)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if reclaimed < 1 {
+		t.Fatalf("expected at least one reclaimed invocation, got %d", reclaimed)
+	}
+
+	recovered, err := repo.Get(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if recovered.Status != "RETRY_SCHEDULED" || recovered.ErrorCode != "INFRASTRUCTURE_ERROR" {
+		t.Fatalf("recovered invocation = %#v, want RETRY_SCHEDULED/INFRASTRUCTURE_ERROR", recovered)
+	}
+	if countOutboxTopic(t, db, inv.ID, "INVOCATION") != 2 {
+		t.Fatalf("expected the acceptance and reclaim outbox rows for the invocation")
+	}
+	if _, err := repo.Claim(ctx, inv.ID); err != nil {
+		t.Fatalf("reclaimed invocation must be claimable again: %v", err)
+	}
+}
+
+func TestAsyncReclaimDeadLettersExhaustedInvocation(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	repo := NewPostgresStore(db)
+	fn := seedFunction(t, db, newFunctionName())
+
+	inv, _, err := repo.Enqueue(ctx, fn, json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := repo.Claim(ctx, inv.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// A crash on the final attempt plus an elapsed lease must dead-letter.
+	if _, err := db.ExecContext(ctx, `UPDATE invocations SET attempt_count=max_attempts, lease_expires_at=now()-interval '1 second' WHERE id=$1`, inv.ID); err != nil {
+		t.Fatalf("age invocation: %v", err)
+	}
+	if _, err := repo.ReclaimExpired(ctx); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	recovered, err := repo.Get(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if recovered.Status != "DEAD_LETTERED" {
+		t.Fatalf("status = %s, want DEAD_LETTERED", recovered.Status)
+	}
+	if countOutboxTopic(t, db, inv.ID, "DLQ") != 1 {
+		t.Fatal("exhausted reclaimed invocation must queue a DLQ outbox row")
+	}
+}
+
+func TestAsyncCapacityFailurePreservesRetryBudget(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	repo := NewPostgresStore(db)
+	fn := seedFunction(t, db, newFunctionName())
+
+	inv, _, err := repo.Enqueue(ctx, fn, json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, err := repo.Claim(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := repo.Complete(ctx, claimed, function.ExecutionResult{}, function.ErrCapacity, 0); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	stored, err := repo.Get(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.Status != "RETRY_SCHEDULED" || stored.ErrorCode != "INFRASTRUCTURE_ERROR" {
+		t.Fatalf("capacity failure = %#v, want RETRY_SCHEDULED/INFRASTRUCTURE_ERROR", stored)
+	}
+	if stored.Attempt != 0 {
+		t.Fatalf("capacity failure must not consume the retry budget, attempt = %d", stored.Attempt)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE invocations SET next_attempt_at=now() WHERE id=$1`, inv.ID); err != nil {
+		t.Fatalf("advance clock: %v", err)
+	}
+	again, err := repo.Claim(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	if again.Attempt != 1 {
+		t.Fatalf("re-claim attempt = %d, want 1 (budget preserved)", again.Attempt)
+	}
+}

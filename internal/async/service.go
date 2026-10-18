@@ -34,7 +34,16 @@ type Store interface {
 	Get(context.Context, string) (Invocation, error)
 	PendingOutbox(context.Context, int) ([]OutboxMessage, error)
 	MarkPublished(context.Context, OutboxMessage) error
+	// ReclaimExpired resets invocations whose worker lease elapsed and returns
+	// how many records were recovered.
+	ReclaimExpired(context.Context) (int, error)
 }
+
+// completionTimeout bounds the terminal write so a stalled database cannot
+// block shutdown indefinitely while still letting the write survive
+// cancellation of the consumer context.
+const completionTimeout = 5 * time.Second
+
 type Publisher interface {
 	Publish(context.Context, string, string) error
 }
@@ -50,6 +59,10 @@ func New(store Store, publisher Publisher, executor function.Executor) *Service 
 func (s *Service) Enqueue(ctx context.Context, fn function.Function, event json.RawMessage, key string) (Invocation, bool, error) {
 	if !json.Valid(event) {
 		return Invocation{}, false, fmt.Errorf("%w: event must be valid JSON", function.ErrInvalidInput)
+	}
+	// Parity with the synchronous path: only an ACTIVE function may accept work.
+	if fn.State != function.StateActive {
+		return Invocation{}, false, fmt.Errorf("%w: function is not active", function.ErrInvalidInput)
 	}
 	inv, duplicate, err := s.store.Enqueue(ctx, fn, event, key)
 	if err != nil {
@@ -74,7 +87,17 @@ func (s *Service) Process(ctx context.Context, id string) error {
 	if errors.Is(invokeCtx.Err(), context.DeadlineExceeded) {
 		runErr = function.ErrTimedOut
 	}
-	return s.store.Complete(ctx, inv, result, runErr, retryDelay(inv.Attempt))
+	// The terminal write must survive shutdown cancellation of the consumer
+	// context, otherwise the invocation is stranded in RUNNING until (or
+	// unless) lease reclaim recovers it.  It remains bounded so a stalled
+	// database cannot block shutdown forever.
+	completeCtx, completeCancel := context.WithTimeout(context.WithoutCancel(ctx), completionTimeout)
+	defer completeCancel()
+	return s.store.Complete(completeCtx, inv, result, runErr, retryDelay(inv.Attempt))
+}
+func (s *Service) Reconcile(ctx context.Context) error {
+	_, err := s.store.ReclaimExpired(ctx)
+	return err
 }
 func (s *Service) Republish(ctx context.Context) error {
 	ids, err := s.store.PendingOutbox(ctx, 100)

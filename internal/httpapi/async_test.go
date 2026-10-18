@@ -39,6 +39,7 @@ func (s *fakeAsyncStore) PendingOutbox(context.Context, int) ([]asyncsvc.OutboxM
 func (s *fakeAsyncStore) MarkPublished(context.Context, asyncsvc.OutboxMessage) error {
 	return errors.New("unused")
 }
+func (s *fakeAsyncStore) ReclaimExpired(context.Context) (int, error) { return 0, nil }
 
 type fakePublisher struct{}
 
@@ -75,7 +76,7 @@ func TestHTTPAsyncInvokeAndStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	accepted := request(t, http.MethodPost, server.URL+"/v1/functions/upper:invoke-async", `{"event":{"text":"hello"}}`)
+	accepted := request(t, http.MethodPost, server.URL+"/v1/functions/invoke-async?name=upper", `{"event":{"text":"hello"}}`)
 	if accepted.StatusCode != http.StatusAccepted {
 		t.Fatalf("invoke-async status = %d, want 202", accepted.StatusCode)
 	}
@@ -112,11 +113,13 @@ func TestHTTPIdempotencyConflictReturns409(t *testing.T) {
 		enqueueFn: func(context.Context, function.Function, json.RawMessage, string) (asyncsvc.Invocation, bool, error) {
 			return asyncsvc.Invocation{}, false, fmt.Errorf("%w: idempotency key has a different payload", function.ErrIdempotencyConflict)
 		},
-		getFn: func(context.Context, string) (asyncsvc.Invocation, error) { return asyncsvc.Invocation{}, function.ErrNotFound },
+		getFn: func(context.Context, string) (asyncsvc.Invocation, error) {
+			return asyncsvc.Invocation{}, function.ErrNotFound
+		},
 	}))
 	defer server.Close()
 
-	response := request(t, http.MethodPost, server.URL+"/v1/functions/upper:invoke-async", `{"event":{"text":"hello"},"idempotency_key":"k"}`)
+	response := request(t, http.MethodPost, server.URL+"/v1/functions/invoke-async?name=upper", `{"event":{"text":"hello"},"idempotency_key":"k"}`)
 	if response.StatusCode != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", response.StatusCode)
 	}
@@ -139,11 +142,58 @@ func TestHTTPAsyncInvokeRequiresValidEvent(t *testing.T) {
 			t.Fatal("store must not be called when the event is missing")
 			return asyncsvc.Invocation{}, false, nil
 		},
-		getFn: func(context.Context, string) (asyncsvc.Invocation, error) { return asyncsvc.Invocation{}, function.ErrNotFound },
+		getFn: func(context.Context, string) (asyncsvc.Invocation, error) {
+			return asyncsvc.Invocation{}, function.ErrNotFound
+		},
 	}))
 	defer server.Close()
 
-	response := request(t, http.MethodPost, server.URL+"/v1/functions/upper:invoke-async", `{}`)
+	response := request(t, http.MethodPost, server.URL+"/v1/functions/invoke-async?name=upper", `{}`)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.StatusCode)
+	}
+}
+
+func TestHTTPAsyncInvokeRejectsInactiveFunction(t *testing.T) {
+	repo := newTestStore()
+	if _, err := repo.Create(context.Background(), function.Function{
+		Name: "off", Handler: "uppercase", State: "DISABLED", Version: 1,
+		Timeout: time.Second, Runtime: function.RuntimeBuiltin, MemoryMB: 128, CPUMillis: 250,
+	}); err != nil {
+		t.Fatalf("seed function: %v", err)
+	}
+	store := &fakeAsyncStore{
+		enqueueFn: func(context.Context, function.Function, json.RawMessage, string) (asyncsvc.Invocation, bool, error) {
+			t.Fatal("store must not be called for a non-active function")
+			return asyncsvc.Invocation{}, false, nil
+		},
+		getFn: func(context.Context, string) (asyncsvc.Invocation, error) {
+			return asyncsvc.Invocation{}, function.ErrNotFound
+		},
+	}
+	service := function.NewService(repo, runtime.NewRouter(runtime.NewDockerExecutor(runtime.NewOSCommandRunner())))
+	server := httptest.NewServer(NewHandler(service, slog.New(slog.NewTextHandler(testingWriter{t}, nil))).WithAsync(asyncsvc.New(store, fakePublisher{}, fakeExecutor{})))
+	defer server.Close()
+
+	response := request(t, http.MethodPost, server.URL+"/v1/functions/invoke-async?name=off", `{"event":{"text":"hi"}}`)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.StatusCode)
+	}
+}
+
+func TestHTTPAsyncInvokeRequiresName(t *testing.T) {
+	server := httptest.NewServer(asyncHandler(t, &fakeAsyncStore{
+		enqueueFn: func(context.Context, function.Function, json.RawMessage, string) (asyncsvc.Invocation, bool, error) {
+			t.Fatal("store must not be called without a name query parameter")
+			return asyncsvc.Invocation{}, false, nil
+		},
+		getFn: func(context.Context, string) (asyncsvc.Invocation, error) {
+			return asyncsvc.Invocation{}, function.ErrNotFound
+		},
+	}))
+	defer server.Close()
+
+	response := request(t, http.MethodPost, server.URL+"/v1/functions/invoke-async", `{"event":{"text":"hi"}}`)
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", response.StatusCode)
 	}
