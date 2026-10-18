@@ -70,15 +70,15 @@ sequenceDiagram
   A-->>C: JSON result or structured error
 ```
 
-Async flow differs after validation: the API creates an invocation in `QUEUED`, publishes a message containing only `invocation_id`, and returns `202`. A durable consumer claims the record, runs it, stores the terminal outcome, and acknowledges only after that durable transition. Redelivery may happen, so execution is at-least-once.
+Async flow differs after validation: the API writes an `invocations` row in `QUEUED` and an `invocation_outbox` row in one transaction, then returns `202` without touching the broker. A republisher publishes `{"invocation_id":...}` and marks the outbox row published; a durable consumer claims the record, runs it, stores the terminal outcome, and commits its Kafka offset only after that durable transition. Publication, execution, and offset commit are separate, so delivery and processing are at-least-once.
 
 ## State machines
 
-Function lifecycle: `CREATED -> DEPLOYING -> ACTIVE`; deployment validation/startup failure gives `FAILED`; an operator can transition `ACTIVE|FAILED -> DISABLED`; a new deployment transitions an active function through `DEPLOYING` while the previous active version remains invokable until atomic activation. `DISABLED` rejects new invocations. Function state describes availability; version state describes artifact readiness.
+Function lifecycle (implemented states): `ACTIVE`, `DISABLED`, `FAILED`. A function is `ACTIVE` on registration; `DISABLED` and `FAILED` exist in the schema and reject new invocations. Multi-step deploy states such as `CREATED`/`DEPLOYING` are not modelled; a deployment moves the active version atomically instead.
 
-Version lifecycle: `PENDING -> VALIDATING -> ACTIVE` or `FAILED`; an older `ACTIVE` version can become `RETIRED` but remains immutable and addressable while retained.
+Version lifecycle: each version is `ACTIVE`, `RETIRED`, or `FAILED`. A deployment retires the current `ACTIVE` row and inserts a new `ACTIVE` row in one transaction; a rollback re-activates a retained version. Retired versions stay immutable and addressable.
 
-Invocation lifecycle: `ACCEPTED -> QUEUED` (async) or `RUNNING` (sync), then exactly one terminal state: `SUCCEEDED`, `FUNCTION_ERROR`, `TIMED_OUT`, `CANCELLED`, or `INFRASTRUCTURE_ERROR`. An async retry changes `RETRY_SCHEDULED -> QUEUED` with an incremented attempt. A terminal exhausted invocation enters `DEAD_LETTERED` after the database outcome and DLQ publication are both durably reconciled.
+Invocation lifecycle: `QUEUED -> RUNNING -> SUCCEEDED | FUNCTION_ERROR | TIMED_OUT | INFRASTRUCTURE_ERROR`, with `RETRY_SCHEDULED` (returning to a due time) for non-terminal failures and `DEAD_LETTERED` once attempts are exhausted. A distinct `ACCEPTED` state and `CANCELLED` are not currently produced.
 
 ## Execution and worker lifecycle
 
@@ -89,20 +89,18 @@ Docker provides process/resource isolation, but it is weaker than a purpose-buil
 ## Package boundaries (target structure)
 
 ```
-cmd/aetherbolt/       composition root; config and HTTP server lifecycle
+cmd/aetherbolt/       composition root; config and HTTP/worker lifecycle
 internal/httpapi/     routing, decoding, response/error mapping, request IDs
 internal/function/    function/version domain types and service
-internal/invocation/  lifecycle, coordinator, idempotency, scheduling contracts
-internal/runtime/     Runtime interface; later Docker implementation
-internal/worker/      bounded workers, warm reuse, graceful drain
-internal/store/       repository interfaces and PostgreSQL implementations
+internal/async/       invocation lifecycle, outbox, retry/DLQ, claiming
+internal/runtime/     Runtime interface and constrained Docker implementation
+internal/worker/      bounded admission, concurrency, graceful drain
+internal/store/       function/version PostgreSQL repository
 internal/queue/       publisher/consumer interfaces and Kafka adapter
-internal/observability/ logging, metrics, health checks
-internal/auth/        later authentication/authorization boundary
 migrations/           ordered SQL migrations
 ```
 
-The HTTP layer must depend on application services, not SQL or Docker directly. Runtime and queue adapters implement small domain-owned interfaces, so Phase 1 built-ins can be replaced without changing endpoint semantics.
+The HTTP layer must depend on application services, not SQL or Docker directly. Runtime and queue adapters implement small domain-owned interfaces (`function.Executor`, `async.Store`, `async.Publisher`), so built-in handlers can be replaced without changing endpoint semantics. Later phases add `internal/observability/` and `internal/auth/` boundaries.
 
 ## Scaling and known limits
 

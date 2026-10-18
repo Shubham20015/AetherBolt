@@ -19,7 +19,7 @@ import (
 
 const maxRuntimeOutputBytes = 1 << 20
 
-var imageReference = regexp.MustCompile(`^aetherbolt-function-[a-z0-9-]+(?::[a-zA-Z0-9._-]+|@sha256:[a-f0-9]{64})$`)
+var imageReference = regexp.MustCompile(`^(aetherbolt-function-[a-z0-9-]+(?::[a-zA-Z0-9._-]+|@sha256:[a-f0-9]{64})|sha256:[a-f0-9]{64})$`)
 
 type Command struct {
 	Name  string
@@ -45,6 +45,21 @@ func (d *DockerExecutor) Validate(fn function.Function) error {
 		return fmt.Errorf("%w: image must use an aetherbolt-function-* local image reference", function.ErrInvalidInput)
 	}
 	return nil
+}
+
+func (d *DockerExecutor) ResolveArtifact(ctx context.Context, fn function.Function) (function.Function, error) {
+	inspectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	result, err := d.runner.Run(inspectCtx, Command{Name: "docker", Args: []string{"image", "inspect", "--format", "{{.Id}}", fn.Image}})
+	if err != nil || result.ExitCode != 0 {
+		return function.Function{}, fmt.Errorf("%w: image is not available locally", function.ErrRuntimeFailure)
+	}
+	artifact := strings.TrimSpace(string(result.Stdout))
+	if !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(artifact) {
+		return function.Function{}, fmt.Errorf("%w: image did not resolve to a content ID", function.ErrRuntimeFailure)
+	}
+	fn.Image = artifact
+	return fn, nil
 }
 
 func (d *DockerExecutor) Invoke(ctx context.Context, fn function.Function, event json.RawMessage) (function.ExecutionResult, error) {

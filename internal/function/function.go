@@ -31,6 +31,11 @@ var (
 	ErrTimedOut       = errors.New("function execution timed out")
 	ErrFunctionFailed = errors.New("function execution failed")
 	ErrRuntimeFailure = errors.New("execution runtime failed")
+
+	// ErrIdempotencyConflict reports that an idempotency key was replayed with a
+	// different payload. It is a distinct conflict rather than an input error so
+	// the API can return 409 instead of 400.
+	ErrIdempotencyConflict = errors.New("idempotency key conflict")
 )
 
 type Function struct {
@@ -63,6 +68,11 @@ type Repository interface {
 	Get(context.Context, string) (Function, error)
 }
 
+type VersionRepository interface {
+	Deploy(context.Context, string, Function) (Function, error)
+	Rollback(context.Context, string, int) (Function, error)
+}
+
 type ExecutionResult struct {
 	Result          json.RawMessage
 	InitDuration    time.Duration
@@ -75,6 +85,10 @@ type Executor interface {
 	Invoke(context.Context, Function, json.RawMessage) (ExecutionResult, error)
 }
 
+type ArtifactResolver interface {
+	ResolveArtifact(context.Context, Function) (Function, error)
+}
+
 type Service struct {
 	repo     Repository
 	executor Executor
@@ -85,6 +99,23 @@ func NewService(repo Repository, executor Executor) *Service {
 }
 
 func (s *Service) Register(ctx context.Context, input RegisterInput) (Function, error) {
+	fn, err := s.buildFunction(input, 1)
+	if err != nil {
+		return Function{}, err
+	}
+	if err := s.executor.Validate(fn); err != nil {
+		return Function{}, err
+	}
+	if resolver, ok := s.executor.(ArtifactResolver); ok {
+		fn, err = resolver.ResolveArtifact(ctx, fn)
+		if err != nil {
+			return Function{}, err
+		}
+	}
+	return s.repo.Create(ctx, fn)
+}
+
+func (s *Service) buildFunction(input RegisterInput, version int) (Function, error) {
 	input.Name = strings.ToLower(strings.TrimSpace(input.Name))
 	input.Handler = strings.TrimSpace(input.Handler)
 	input.Description = strings.TrimSpace(input.Description)
@@ -120,15 +151,45 @@ func (s *Service) Register(ctx context.Context, input RegisterInput) (Function, 
 	if input.CPUMillis < 50 || input.CPUMillis > 1000 {
 		return Function{}, fmt.Errorf("%w: cpu_millis must be between 50 and 1000", ErrInvalidInput)
 	}
-	fn := Function{
+	return Function{
 		Name: input.Name, Handler: input.Handler, Description: input.Description, State: StateActive,
-		Version: 1, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond, Runtime: input.Runtime,
+		Version: version, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond, Runtime: input.Runtime,
 		Image: input.Image, MemoryMB: input.MemoryMB, CPUMillis: input.CPUMillis,
+	}, nil
+}
+
+func (s *Service) Deploy(ctx context.Context, name string, input RegisterInput) (Function, error) {
+	current, err := s.Get(ctx, name)
+	if err != nil {
+		return Function{}, err
+	}
+	input.Name = current.Name
+	fn, err := s.buildFunction(input, current.Version+1)
+	if err != nil {
+		return Function{}, err
 	}
 	if err := s.executor.Validate(fn); err != nil {
 		return Function{}, err
 	}
-	return s.repo.Create(ctx, fn)
+	if resolver, ok := s.executor.(ArtifactResolver); ok {
+		fn, err = resolver.ResolveArtifact(ctx, fn)
+		if err != nil {
+			return Function{}, err
+		}
+	}
+	repo, ok := s.repo.(VersionRepository)
+	if !ok {
+		return Function{}, fmt.Errorf("%w: version store unavailable", ErrRuntimeFailure)
+	}
+	return repo.Deploy(ctx, current.Name, fn)
+}
+
+func (s *Service) Rollback(ctx context.Context, name string, version int) (Function, error) {
+	repo, ok := s.repo.(VersionRepository)
+	if !ok {
+		return Function{}, fmt.Errorf("%w: version store unavailable", ErrRuntimeFailure)
+	}
+	return repo.Rollback(ctx, strings.ToLower(strings.TrimSpace(name)), version)
 }
 
 func (s *Service) Get(ctx context.Context, name string) (Function, error) {

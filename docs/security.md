@@ -13,9 +13,10 @@
 - Docker workloads: non-root user, non-privileged, no Docker socket mount, dropped capabilities, `no-new-privileges`, read-only filesystem when compatible, memory/CPU/pid limits, scoped writable temp directory, and egress restrictions.
 - Runtime: deadline propagation, forced cleanup, output-size limits, redaction of configured secret values, and no event payload logging by default.
 - Infrastructure: TLS/auth for external deployment, least-privilege database/broker identities, configuration through environment or a secret provider, never image layers/repository/logs.
+- Messaging: Kafka messages carry only an `invocation_id`, never the event payload, so broker storage exposes identifiers rather than user data; events live only in PostgreSQL.
 
 ## Non-claims
 
 Containers are a defense layer, not a complete tenant-isolation guarantee. A hostile multi-tenant production design needs stronger sandboxing, kernel hardening, network policy, image provenance, monitoring, and independent security review. Docker daemon access is privileged; it must remain exclusively on trusted platform components.
 
-Phase 2–3's concrete control set and known limitations are documented in [execution.md](execution.md).
+The concrete Docker control set and known limitations are documented in [execution.md](execution.md). At-least-once delivery, the outbox, and the DLQ durability contract are documented in [async-and-versioning.md](async-and-versioning.md) and [data-model.md](data-model.md).

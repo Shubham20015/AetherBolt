@@ -35,12 +35,17 @@ func TestPostgresFunctionStore(t *testing.T) {
 
 	store := NewPostgresFunctionStore(db)
 	const name = "postgres-integration-test"
-	if _, err := db.ExecContext(ctx, "DELETE FROM functions WHERE name = $1", name); err != nil {
-		t.Fatalf("clean test function: %v", err)
+	// Delete in dependency order so the function_versions FK (added in 000003)
+	// does not block cleanup.
+	clean := func() {
+		ctx := context.Background()
+		_, _ = db.ExecContext(ctx, `DELETE FROM invocation_outbox WHERE invocation_id IN (SELECT id FROM invocations WHERE function_name=$1)`, name)
+		_, _ = db.ExecContext(ctx, `DELETE FROM invocations WHERE function_name=$1`, name)
+		_, _ = db.ExecContext(ctx, `DELETE FROM function_versions WHERE function_name=$1`, name)
+		_, _ = db.ExecContext(ctx, `DELETE FROM functions WHERE name=$1`, name)
 	}
-	t.Cleanup(func() {
-		_, _ = db.ExecContext(context.Background(), "DELETE FROM functions WHERE name = $1", name)
-	})
+	clean()
+	t.Cleanup(clean)
 
 	created, err := store.Create(ctx, function.Function{
 		Name: name, Handler: "echo", State: function.StateActive, Version: 1, Timeout: time.Second,

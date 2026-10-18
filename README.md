@@ -4,7 +4,7 @@ AetherBolt is a learning-focused, self-hosted serverless platform inspired by AW
 
 ## Current status
 
-Phases 1–3 implement a Go HTTP service, PostgreSQL function registry, trusted built-in handlers, constrained Docker execution of pre-built local images, and bounded synchronous scheduling. Asynchronous delivery, deployment/version APIs, warm container reuse, and autoscaling remain deferred.
+Phases 1–5 implement a Go HTTP service, PostgreSQL function registry and immutable versions, trusted built-in handlers, constrained Docker execution, bounded synchronous scheduling, and Kafka-backed asynchronous delivery. Warm container reuse and autoscaling remain deferred.
 
 ## Scope
 
@@ -37,9 +37,10 @@ Go, Docker/Compose, PostgreSQL, Kafka, Prometheus, and Grafana. They will be int
 Requirements: Go 1.26+ and Docker Compose. Kafka is not needed until Phase 4.
 
 ```sh
-docker compose up -d postgres
+docker compose up -d postgres kafka kafka-init
 psql "postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable" -f migrations/000001_create_functions.up.sql
 psql "postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable" -f migrations/000002_add_execution_config.up.sql
+psql "postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable" -f migrations/000003_versions_and_async.up.sql
 go mod tidy
 AETHERBOLT_DATABASE_URL='postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable' go run ./cmd/aetherbolt
 ```
@@ -47,15 +48,34 @@ AETHERBOLT_DATABASE_URL='postgres://localuser:localpassword@localhost:5432/aethe
 In another terminal:
 
 ```sh
+# synchronous
 curl -sS -X POST http://localhost:8080/v1/functions -H 'Content-Type: application/json' -d '{"name":"upper","handler":"uppercase"}'
 curl -sS -X POST http://localhost:8080/v1/functions/upper:invoke -H 'Content-Type: application/json' -d '{"event":{"text":"hello"}}'
+
+# asynchronous (durable accept, then poll)
+curl -sS -X POST http://localhost:8080/v1/functions/upper:invoke-async -H 'Content-Type: application/json' -d '{"event":{"text":"hello"},"idempotency_key":"demo-1"}'
+curl -sS http://localhost:8080/v1/invocations/<invocation_id>
+
+# deploy an immutable version, then roll back
+curl -sS -X POST http://localhost:8080/v1/functions/upper/versions -H 'Content-Type: application/json' -d '{"handler":"uppercase"}'
+curl -sS -X POST http://localhost:8080/v1/functions/upper/rollback -H 'Content-Type: application/json' -d '{"version":1}'
+```
+
+## Tests
+
+```sh
 go test ./...
 go test -race ./...
 go vet ./...
-AETHERBOLT_TEST_DATABASE_URL='postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable' go test ./internal/store -run TestPostgresFunctionStore
+
+# PostgreSQL integration tests (schema must be applied)
+AETHERBOLT_TEST_DATABASE_URL='postgres://localuser:localpassword@localhost:5432/aetherbolt?sslmode=disable' go test ./internal/store ./internal/async
+
+# Kafka end-to-end test (needs a running broker)
+AETHERBOLT_TEST_KAFKA_BROKER=localhost:9092 go test ./internal/queue
 ```
 
-The tests exercise the service and HTTP API with an in-memory repository; they do not prove PostgreSQL wiring. Add the database integration test in Phase 1 only when a local Docker daemon and Go toolchain are available.
+Without the environment variables, the integration tests skip and only the pure unit tests run.
 
 ## Container function and bounded scheduling
 
@@ -71,16 +91,22 @@ curl -sS -X POST http://localhost:8080/v1/functions/container-echo:invoke \
   -d '{"event":{"message":"hello from a container"}}'
 ```
 
-The platform only accepts locally built `aetherbolt-function-*` image references in this milestone and uses `docker run --pull never`; this is intentional until Phase 5 supplies image provenance and deployment workflows. See [the execution contract and limits](docs/execution.md).
+The platform only accepts locally built `aetherbolt-function-*` image references and uses `docker run --pull never`. Registering or deploying a container function resolves the image to its `sha256:` content ID (`docker image inspect`) and stores that digest as the immutable artifact reference, so a later re-tag or rebuild cannot silently change what a deployed version runs. Remote registries, signatures, and image upload remain future work. See [the execution contract and limits](docs/execution.md).
 
 The scheduler is configured by `AETHERBOLT_MAX_CONCURRENT` (default `4`) and `AETHERBOLT_QUEUE_CAPACITY` (default `16`). Once `active + waiting` reaches their sum, synchronous invocation returns `429`; during graceful shutdown, new work returns `503` while admitted work drains.
 
-### Phase 1 test intent
+The async data plane is configured by `AETHERBOLT_KAFKA_BROKER` (default `localhost:9092`) and `AETHERBOLT_KAFKA_TOPIC` (default `aetherbolt.invocations`); the dead-letter topic is derived as `<topic>.dlq`. An accepted async invocation is written to an outbox in the same transaction as its row, so acceptance succeeds even while the broker is down; a republisher reconciles unpublished records (including DLQ records) after the broker returns.
+
+### Test intent
 
 - `internal/function`: validates handler allowlisting, registration defaults, duplicate names, and invocation result propagation. These prevent invalid registry state and accidental execution of an unapproved handler.
 - `internal/httpapi`: exercises the API end-to-end via `httptest`, including request ID propagation, registration, invocation, and structured `404` errors. This prevents route/serialization and public error-contract regressions.
-- `internal/store` contains an opt-in PostgreSQL integration test. It verifies that the migration-backed repository creates, reads, and rejects duplicate function names, then deletes only its own test row. Run it with `AETHERBOLT_TEST_DATABASE_URL` as shown above.
-- `internal/runtime` verifies the constrained Docker command, execution-envelope validation, timeout cleanup, and failure classification without requiring Docker in every unit-test run. `internal/worker` verifies bounded admission and graceful drain behavior; run both with the race detector as part of the commands above.
+- `internal/runtime` verifies the constrained Docker command, execution-envelope validation, timeout cleanup, and failure classification without requiring Docker in every unit-test run. `internal/worker` verifies bounded admission and graceful drain behavior.
+- `internal/async` has unit tests (duplicate acknowledgement, retry delay bounds/jitter, outbox reconciliation after a broker outage, deadline classification) and opt-in PostgreSQL integration tests (claim/complete lifecycle, idempotency dedupe and conflict, retry-then-dead-letter with DLQ outbox row, claim guards, single-winner concurrent claim, and version pinning after a deploy).
+- `internal/store` has an opt-in PostgreSQL integration test for create/read/duplicate-name, plus versioning tests for deploy, rollback, and concurrent deployment (unique version allocation with exactly one active version).
+- `internal/queue` has an opt-in Kafka end-to-end test covering publish/consume round-trip, DLQ topic routing, and clean consumer shutdown on cancellation.
+
+Run the unit suites normally; run the integration suites with the environment variables shown under [Tests](#tests). Race-check the scheduler, async, and store suites because they exercise concurrent claim/admission paths.
 
 ## Project principles
 

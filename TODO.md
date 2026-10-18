@@ -21,15 +21,34 @@
 - [x] Add bounded admission, concurrency limits, client cancellation, overload response, and graceful draining.
 - [x] Add runtime, scheduler, race, PostgreSQL, and live Docker verification.
 
-## Subsequent priority order
+## Phase 4 — asynchronous delivery
 
-1. Phase 4: Kafka async delivery, retry, DLQ, idempotency/outbox.
-2. Phase 5: artifacts, immutable deployment versions, rollback, access control.
-3. Phase 6: warm reuse, idle eviction, bounded autoscaling.
-4. Phase 7: Prometheus/Grafana, runbooks, operational checks.
-5. Phase 8: failure injection, reconciliation, distributed-systems hardening.
-6. Phase 9: reproducible benchmarks, profiles, measured report.
-7. Phase 10: Compose, CI, deployment guide, portfolio demo.
+- [x] Durable outbox-driven publishing; the request path never publishes directly.
+- [x] Kafka publisher/consumer adapter, invocation and DLQ topics, Compose topic bootstrap.
+- [x] Idempotency keys, including a dedicated `409 idempotency_conflict` for a mismatched payload.
+- [x] Bounded retries with exponential backoff and full jitter; a durable DLQ outbox row on exhaustion.
+- [x] Duplicate deliveries acknowledged without re-running (conditional claim transition).
+- [x] Consumer and republisher cancellation during shutdown.
+- [x] Focused async unit tests and opt-in PostgreSQL/Kafka integration tests.
+- [ ] Per-invocation execution lease and reclaim of stale `RUNNING` rows.
+- [ ] Outbox compaction / retention for historical retry rows.
+
+## Phase 5 — immutable versions and deployment
+
+- [x] `function_versions` table; initial version 1 created in the same transaction as the function.
+- [x] Deploy inserts an immutable version and atomically moves the active pointer under a row lock.
+- [x] Rollback selects a retained version.
+- [x] Container images resolved to a `sha256:` content ID before activation.
+- [x] Concurrent-deploy and invocation-version-pinning integration tests.
+- [ ] API authentication and role-based authorization; audit events.
+
+## Remaining phases
+
+1. Phase 6: warm reuse, idle eviction, bounded autoscaling.
+2. Phase 7: Prometheus/Grafana, runbooks, operational checks.
+3. Phase 8: failure injection, reconciliation, distributed-systems hardening.
+4. Phase 9: reproducible benchmarks, profiles, measured report.
+5. Phase 10: Compose, CI, deployment guide, portfolio demo.
 
 ## Phase 0 acceptance criteria
 

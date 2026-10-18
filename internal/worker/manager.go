@@ -38,6 +38,13 @@ func NewManager(executor function.Executor, config Config) (*Manager, error) {
 }
 
 func (m *Manager) Validate(fn function.Function) error { return m.executor.Validate(fn) }
+func (m *Manager) ResolveArtifact(ctx context.Context, fn function.Function) (function.Function, error) {
+	resolver, ok := m.executor.(function.ArtifactResolver)
+	if !ok {
+		return fn, nil
+	}
+	return resolver.ResolveArtifact(ctx, fn)
+}
 
 func (m *Manager) Invoke(ctx context.Context, fn function.Function, event json.RawMessage) (function.ExecutionResult, error) {
 	m.mu.Lock()

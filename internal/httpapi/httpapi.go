@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	asyncsvc "github.com/shubhamjain/aetherbolt/internal/async"
 	"github.com/shubhamjain/aetherbolt/internal/function"
 )
 
@@ -20,25 +21,113 @@ const maxBodyBytes = 1 << 20
 type Handler struct {
 	functions *function.Service
 	logger    *slog.Logger
+	async     *asyncsvc.Service
 }
 
-func NewHandler(functions *function.Service, logger *slog.Logger) http.Handler {
-	return requestIDMiddleware(&Handler{functions: functions, logger: logger})
+func (h *Handler) WithAsync(service *asyncsvc.Service) *Handler { h.async = service; return h }
+
+func NewHandler(functions *function.Service, logger *slog.Logger) *Handler {
+	return &Handler{functions: functions, logger: logger}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestIDMiddleware(http.HandlerFunc(h.serveHTTP)).ServeHTTP(w, r)
+}
+
+func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/functions":
 		h.register(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/functions/") && strings.HasSuffix(r.URL.Path, "/versions"):
+		h.deploy(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/functions/") && strings.HasSuffix(r.URL.Path, "/rollback"):
+		h.rollback(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/functions/") && !strings.Contains(r.URL.Path, ":"):
 		h.get(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/functions/") && strings.HasSuffix(r.URL.Path, ":invoke"):
 		h.invoke(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/functions/") && strings.HasSuffix(r.URL.Path, ":invoke-async"):
+		h.invokeAsync(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/invocations/"):
+		h.getInvocation(w, r)
 	default:
 		writeError(w, r, http.StatusNotFound, "not_found", "route not found")
 	}
+}
+func (h *Handler) getInvocation(w http.ResponseWriter, r *http.Request) {
+	if h.async == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "async_unavailable", "async invocation is not configured")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/invocations/")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, r, http.StatusNotFound, "not_found", "route not found")
+		return
+	}
+	inv, err := h.async.Get(r.Context(), id)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"invocation_id": inv.ID, "function": inv.FunctionName, "version": inv.Version, "status": inv.Status, "attempt_count": inv.Attempt, "max_attempts": inv.MaxAttempts, "next_attempt_at": inv.NextAttemptAt, "result": inv.Result, "error_code": inv.ErrorCode})
+}
+func (h *Handler) invokeAsync(w http.ResponseWriter, r *http.Request) {
+	if h.async == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "async_unavailable", "async invocation is not configured")
+		return
+	}
+	var in struct {
+		Event          json.RawMessage `json:"event"`
+		IdempotencyKey string          `json:"idempotency_key"`
+	}
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	fn, err := h.functions.Get(r.Context(), strings.TrimSuffix(functionName(r.URL.Path), ":invoke-async"))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	inv, duplicate, err := h.async.Enqueue(r.Context(), fn, in.Event, in.IdempotencyKey)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"invocation_id": inv.ID, "status": inv.Status, "duplicate": duplicate})
+}
+func (h *Handler) deploy(w http.ResponseWriter, r *http.Request) {
+	var input function.RegisterInput
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/functions/"), "/versions")
+	fn, err := h.functions.Deploy(r.Context(), name, input)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, responseFunction(fn))
+}
+func (h *Handler) rollback(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Version int `json:"version"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if input.Version < 1 {
+		writeError(w, r, http.StatusBadRequest, "invalid_request", "version must be positive")
+		return
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/functions/"), "/rollback")
+	fn, err := h.functions.Rollback(r.Context(), name, input.Version)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, responseFunction(fn))
 }
 
 func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +175,8 @@ func (h *Handler) writeDomainError(w http.ResponseWriter, r *http.Request, err e
 		writeError(w, r, http.StatusNotFound, "function_not_found", err.Error())
 	case errors.Is(err, function.ErrAlreadyExists):
 		writeError(w, r, http.StatusConflict, "function_already_exists", err.Error())
+	case errors.Is(err, function.ErrIdempotencyConflict):
+		writeError(w, r, http.StatusConflict, "idempotency_conflict", err.Error())
 	case errors.Is(err, function.ErrUnknownHandler), errors.Is(err, function.ErrInvalidInput):
 		writeError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, function.ErrCapacity):

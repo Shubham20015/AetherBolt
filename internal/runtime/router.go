@@ -57,6 +57,13 @@ func (r *Router) Invoke(ctx context.Context, fn function.Function, event json.Ra
 	return function.ExecutionResult{Result: result, HandlerDuration: elapsed}, nil
 }
 
+func (r *Router) ResolveArtifact(ctx context.Context, fn function.Function) (function.Function, error) {
+	if fn.Runtime != function.RuntimeContainer {
+		return fn, nil
+	}
+	return r.containers.ResolveArtifact(ctx, fn)
+}
+
 type echoHandler struct{}
 
 func (echoHandler) Invoke(ctx context.Context, event json.RawMessage) (json.RawMessage, error) {
